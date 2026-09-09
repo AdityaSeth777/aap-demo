@@ -73,7 +73,7 @@ fi
 # we also need describe output, the previous container's logs, the container
 # state/exit code, namespace events, and the CSV conditions from OLM.
 dump_operator_diagnostics() {
-  local _label="$1"   # human-readable operator name
+  local _label="$1" # human-readable operator name
   local _csv_label="$2"
 
   echo "" >&2

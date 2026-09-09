@@ -2808,19 +2808,24 @@ cmd_enable() {
   if [ "$_skip_addon_save" != true ]; then
     _addons_add "$addon"
   fi
-  export AAP_DEMO_WIRE_AFTER_DEPLOY=0
+  # AO imports its workflows immediately after wiring because the importer needs
+  # the AAP credential created by addon-wire.sh. Keep deferred wiring for others.
+  if [ "$addon" = "ao" ]; then
+    export AAP_DEMO_WIRE_AFTER_DEPLOY=1
+  else
+    export AAP_DEMO_WIRE_AFTER_DEPLOY=0
+  fi
   bash "$addon_dir/deploy.sh" "$@"
   unset AAP_DEMO_WIRE_AFTER_DEPLOY
   if [ "$_skip_addon_save" != true ]; then
     echo "  Saved to config: ADDONS=$(_addons_list | tr ' ' ',')"
   fi
   if [ "$addon" = "ao" ]; then
-    if ! _aap_demo_run_addon_wire true; then
-      echo ""
-      echo "  Automation Orchestrator is installed but integration wiring failed."
-      echo "  Re-run: aap-demo wire"
-      return 1
-    fi
+    # The AO addon performs wiring before provisioning AAP templates and
+    # importing workflows. A second login here can fail when AO's initial
+    # password secret is stale after the instance has already been initialized.
+    # `aap-demo wire` remains available for an explicit retry.
+    :
   else
     _aap_demo_run_addon_wire false
   fi

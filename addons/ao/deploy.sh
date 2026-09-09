@@ -594,6 +594,31 @@ print(json.dumps({
   echo "✓ AO SSRF allowlist includes ${_aap_host}"
 }
 
+allow_aap_to_ao_backend() {
+  kubectl apply -f - <<EOF >/dev/null
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: automation-orchestrator-allow-aap
+  namespace: ${NAMESPACE}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: automation-orchestrator
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ${AAP_NAMESPACE}
+      ports:
+        - protocol: TCP
+          port: 8000
+EOF
+}
+
 show_access_info() {
   local AO_ROUTE PASS_SECRET AO_PASSWORD
   AO_ROUTE=$(kubectl get routes -n "$NAMESPACE" \
@@ -623,6 +648,91 @@ show_access_info() {
     echo "  Password: kubectl get secret -n $NAMESPACE | grep admin-password"
   fi
   echo "  Status:   kubectl get pods -n $NAMESPACE"
+}
+
+sync_ao_demos() {
+  local _route _token _aap_credential _aap_integration _project _ao_namespace
+  local -a _import_args
+  _route=$(kubectl get route -n "$NAMESPACE" -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
+  [ -n "$_route" ] || return 0
+
+  # The wiring layer creates these records and keeps their credentials current.
+  _ao_namespace="$NAMESPACE"
+  NAMESPACE="$AAP_NAMESPACE"
+  AO_NAMESPACE="$_ao_namespace"
+  # shellcheck source=../../includes/addon-wire.sh
+  source "${REPO_ROOT}/includes/addon-wire.sh"
+  _token=$(wire_ao_login_token 2>/dev/null || true)
+  _aap_credential=$(wire_ao_find_credential_by_name "$WIRE_AAP_CREDENTIAL_NAME" 2>/dev/null || true)
+  _aap_integration=$(wire_ao_find_integration_by_name "$WIRE_AAP_INTEGRATION_NAME" 2>/dev/null || true)
+  _project=$(wire_ao_default_project_id 2>/dev/null || true)
+  if [ -z "$_token" ] || [ -z "$_aap_credential" ] || [ -z "$_aap_integration" ]; then
+    echo "  ⚠ AO demo synchronization deferred (AO credentials not ready)"
+    return 0
+  fi
+
+  _import_args=(
+    --route "$_route"
+    --token "$_token"
+    --aap-credential-id "$_aap_credential"
+    --aap-integration-id "$_aap_integration"
+  )
+  _import_args+=(
+    --repository "${AO_DEMOS_REPOSITORY:-https://github.com/ansible-tmm/aap-orchestrator-demos}"
+    --ref "${AO_DEMOS_REF:-abcc1a1482a}"
+  )
+  if [ -n "${AO_AGENT_CREDENTIAL_ID:-}" ]; then
+    _import_args+=(--agent-credential-id "$AO_AGENT_CREDENTIAL_ID")
+  fi
+  if [ -n "$_project" ]; then
+    _import_args+=(--project-id "$_project")
+  fi
+  python3 "${SCRIPT_DIR}/scripts/import-demos.py" "${_import_args[@]}" || true
+}
+
+AO_AAP_SYNC_RAN=0
+
+provision_aap_demos() {
+  local _aap_route _ao_route _aap_token _ao_namespace _ao_token _ao_credential _ao_integration
+  local -a _provision_args
+  _aap_route=$(aap_gateway_route_host)
+  _ao_route=$(wire_ao_route_host 2>/dev/null || true)
+  _ao_token=$(wire_ao_login_token 2>/dev/null || true)
+  _ao_credential=$(wire_ao_find_credential_by_name "$WIRE_AAP_CREDENTIAL_NAME" 2>/dev/null || true)
+  _ao_integration=$(wire_ao_find_integration_by_name "$WIRE_AAP_INTEGRATION_NAME" 2>/dev/null || true)
+  _ao_namespace="$NAMESPACE"
+  NAMESPACE="$AAP_NAMESPACE"
+  _aap_token=$(wire_aap_gateway_token "aap-demo AO template provisioning" write 2>/dev/null || true)
+  NAMESPACE="$_ao_namespace"
+  if [ -z "$_aap_route" ] || [ -z "$_aap_token" ]; then
+    echo "  ⚠ AAP demo template provisioning deferred (AAP credentials not ready)"
+    return 0
+  fi
+  _provision_args=(
+    --route "$_aap_route"
+    --token "$_aap_token"
+  )
+  if [ -n "$_ao_token" ] && [ -n "$_ao_credential" ] && [ -n "$_ao_integration" ]; then
+    _provision_args+=(
+      --ao-api-url "${AO_SYNC_API_URL:-https://router-internal-default.openshift-ingress.svc.cluster.local/api/v1}"
+      --ao-api-host "$_ao_route"
+      --ao-token "$_ao_token"
+      --ao-credential-id "$_ao_credential"
+      --ao-integration-id "$_ao_integration"
+      --control-repository "${AO_SYNC_REPOSITORY:-https://github.com/RedHatOfficial/aap-demo.git}"
+      --control-branch "${AO_SYNC_BRANCH:-main}"
+      --ao-demo-ref "${AO_DEMOS_REF:-abcc1a1482a}"
+    )
+  else
+    echo "  ⚠ AAP AO sync job deferred (AO credentials not ready)"
+  fi
+  if python3 "${SCRIPT_DIR}/scripts/provision-aap-demos.py" "${_provision_args[@]}"; then
+    if [ -n "$_ao_token" ] && [ -n "$_ao_credential" ] && [ -n "$_ao_integration" ]; then
+      AO_AAP_SYNC_RAN=1
+    fi
+  else
+    echo "  ⚠ AAP demo provisioning or AO sync job failed"
+  fi
 }
 
 AO_PULL_SECRET_NAME="${AO_PULL_SECRET_NAME:-automation-orchestrator-pull-secret}"
@@ -677,6 +787,47 @@ postgres_database_exists() {
   _pod=$(postgres_primary_pod)
   kubectl exec -n "$NAMESPACE" "$_pod" -- psql -U postgres -tAc \
     "SELECT 1 FROM pg_database WHERE datname='${_db}'" 2>/dev/null | grep -qx 1
+}
+
+reset_ao_postgres_storage() {
+  local _pod _pods _i
+
+  kubectl delete cluster orchestrator-postgres -n "$NAMESPACE" 2>/dev/null || true
+  kubectl wait --for=delete cluster/orchestrator-postgres -n "$NAMESPACE" \
+    --timeout=180s 2>/dev/null || true
+
+  # CNPG can leave the old primary terminating while its PVC is being
+  # released. Do not recreate the cluster until every old pod is gone.
+  _pods=$(kubectl get pods -n "$NAMESPACE" \
+    -l cnpg.io/cluster=orchestrator-postgres -o name 2>/dev/null || true)
+  for _pod in $_pods; do
+    kubectl delete "$_pod" -n "$NAMESPACE" --wait=false 2>/dev/null || true
+  done
+  for _i in $(seq 1 90); do
+    if ! kubectl get pods -n "$NAMESPACE" \
+      -l cnpg.io/cluster=orchestrator-postgres --no-headers 2>/dev/null \
+      | grep -q .; then
+      break
+    fi
+    sleep 2
+  done
+  _pods=$(kubectl get pods -n "$NAMESPACE" \
+    -l cnpg.io/cluster=orchestrator-postgres -o name 2>/dev/null || true)
+  for _pod in $_pods; do
+    echo "  Force-removing stale PostgreSQL pod ${_pod#pod/}..."
+    kubectl delete "$_pod" -n "$NAMESPACE" --grace-period=0 --force \
+      2>/dev/null || true
+  done
+
+  if kubectl get pvc orchestrator-postgres-1 -n "$NAMESPACE" &>/dev/null; then
+    kubectl delete pvc orchestrator-postgres-1 -n "$NAMESPACE" \
+      --wait=false 2>/dev/null || true
+    if ! kubectl wait --for=delete pvc/orchestrator-postgres-1 \
+      -n "$NAMESPACE" --timeout=180s 2>/dev/null; then
+      echo "ERROR: PostgreSQL PVC did not finish deleting; refusing to recreate AO." >&2
+      exit 1
+    fi
+  fi
 }
 
 ensure_postgres_database() {
@@ -757,8 +908,16 @@ link_ao_pull_secrets_to_operator() {
 }
 
 deploy_ao_instance() {
-  kubectl delete secret automation-orchestrator-initial-admin-password \
-    -n "$NAMESPACE" 2>/dev/null || true
+  # The initial admin Secret is only consumed during first database
+  # initialization. Keep it in place when PostgreSQL is reused, otherwise a
+  # normal re-enable would publish a new password that does not match AO's
+  # existing admin record. A forced reinstall resets PostgreSQL above, so it
+  # must remove the old bootstrap Secret and let the operator generate a new
+  # one for the fresh database.
+  if [ -n "$FORCE" ]; then
+    kubectl delete secret automation-orchestrator-initial-admin-password \
+      -n "$NAMESPACE" 2>/dev/null || true
+  fi
 
   echo "Creating AutomationOrchestrator instance (aapctl GitOps CR)..."
   sed -e "s|__NAMESPACE__|${NAMESPACE}|g" \
@@ -885,7 +1044,22 @@ if [ -z "$FORCE" ]; then
     echo "  Use FORCE=1 aap-demo enable ao (or ./deploy.sh --force) to reinstall."
     echo ""
     configure_ao_local_aap_access
+    allow_aap_to_ao_backend
     show_access_info
+    if [ "${AAP_DEMO_WIRE_AFTER_DEPLOY:-1}" != "0" ]; then
+      # shellcheck source=../../includes/addon-wire.sh
+      AO_NAMESPACE="$NAMESPACE"
+      NAMESPACE="$AAP_NAMESPACE"
+      source "${REPO_ROOT}/includes/addon-wire.sh"
+      aap_demo_wire || true
+      NAMESPACE="$AO_NAMESPACE"
+    fi
+    if [ "${AO_IMPORT_DEMOS:-1}" != "0" ]; then
+      provision_aap_demos
+      if [ "$AO_AAP_SYNC_RAN" -eq 0 ]; then
+        sync_ao_demos
+      fi
+    fi
     exit 0
   fi
 fi
@@ -960,9 +1134,7 @@ if [ -n "$FORCE" ] || [ -n "$_legacy_secret" ]; then
   if kubectl get cluster orchestrator-postgres -n "$NAMESPACE" &>/dev/null \
     || kubectl get pvc orchestrator-postgres-1 -n "$NAMESPACE" &>/dev/null; then
     echo "  Resetting postgres cluster for fresh init..."
-    kubectl delete cluster orchestrator-postgres -n "$NAMESPACE" 2>/dev/null || true
-    kubectl wait --for=delete cluster/orchestrator-postgres -n "$NAMESPACE" --timeout=120s 2>/dev/null || true
-    kubectl delete pvc orchestrator-postgres-1 -n "$NAMESPACE" --timeout=60s 2>/dev/null || true
+    reset_ao_postgres_storage
   fi
 fi
 
@@ -1221,11 +1393,25 @@ if [ -z "${_ao_route:-}" ]; then
 fi
 echo ""
 configure_ao_local_aap_access
+allow_aap_to_ao_backend
 show_access_info
 
 # Wire AO ↔ AAP and MCP when deploy.sh is invoked directly (not via aap-demo enable).
 if [ "${AAP_DEMO_WIRE_AFTER_DEPLOY:-1}" != "0" ]; then
   # shellcheck source=../../includes/addon-wire.sh
+  NAMESPACE="$AAP_NAMESPACE"
+  AO_NAMESPACE="automation-orchestrator"
   source "${REPO_ROOT}/includes/addon-wire.sh"
   aap_demo_wire || true
+  NAMESPACE="$AO_NAMESPACE"
+fi
+
+# Import the upstream AO workflows after integrations and credentials exist. The
+# workflow nodes launch AAP job templates, so playbooks remain executed and
+# governed by AAP rather than being run directly by this addon.
+if [ "${AO_IMPORT_DEMOS:-1}" != "0" ]; then
+  provision_aap_demos
+  if [ "$AO_AAP_SYNC_RAN" -eq 0 ]; then
+    sync_ao_demos
+  fi
 fi
